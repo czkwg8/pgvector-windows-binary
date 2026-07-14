@@ -9,7 +9,7 @@
 pgvector doesn't ship prebuilt Windows binaries, so building it means installing
 Visual Studio and running `nmake` yourself. This repo does that for you: a GitHub
 Actions workflow watches [pgvector/pgvector](https://github.com/pgvector/pgvector)
-for new releases, compiles the extension natively on Windows against every
+for new version tags, compiles the extension natively on Windows against every
 supported PostgreSQL major version, and publishes the packaged `.dll` + SQL files
 to this repo's [Releases](../../releases).
 
@@ -17,7 +17,7 @@ to this repo's [Releases](../../releases).
 
 Grab the archive matching your PostgreSQL major version from the
 [Releases page](../../releases). Each release corresponds to an upstream pgvector
-version (e.g. `v0.8.0`) and contains one zip per PostgreSQL major:
+version tag (e.g. `v0.8.0`) and contains one zip per PostgreSQL major:
 
 ```
 pgvector-v0.8.0-pg18-windows-x64.zip
@@ -48,7 +48,7 @@ major line).
 The workflow ([`.github/workflows/build-pgvector-windows.yml`](.github/workflows/build-pgvector-windows.yml))
 runs three jobs:
 
-1. **check** — resolves the target pgvector version (latest upstream release, or
+1. **check** — resolves the target pgvector version (latest upstream tag, or
    a version you pass manually) and skips the build if this repo already has a
    matching release. It also queries
    [`postgresql.org/versions.json`](https://www.postgresql.org/versions.json) to
@@ -71,12 +71,12 @@ repositories, so no extra cost for this workflow.
 
 ## Triggers
 
-- **Scheduled** — checks daily for a new upstream release and builds it
+- **Scheduled** — checks daily for a new upstream tag and builds it
   automatically. (Scheduled runs only fire from the repo's default branch.)
 - **Manual** — via the Actions tab → *Build pgvector for Windows* → *Run
   workflow*, with optional inputs:
   - `version` — a specific pgvector tag to build (e.g. `v0.8.0`). Defaults to the
-    latest upstream release.
+    latest upstream tag.
   - `force` — rebuild even if a release for that version already exists.
 
 ## License

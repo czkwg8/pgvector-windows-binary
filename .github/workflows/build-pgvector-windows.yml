@@ -48,11 +48,20 @@ jobs:
           set -euo pipefail
 
           # Determine the target version: explicit input wins, otherwise the
-          # latest upstream release tag.
+          # latest upstream tag. pgvector ships versions as git tags (e.g.
+          # v0.8.0), not GitHub Releases, so read the tag list and pick the
+          # highest semver-looking tag.
           if [ -n "${INPUT_VERSION}" ]; then
             version="${INPUT_VERSION}"
           else
-            version="$(gh release view --repo "${UPSTREAM_REPO}" --json tagName --jq .tagName)"
+            version="$(gh api --paginate "repos/${UPSTREAM_REPO}/tags" --jq '.[].name' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n1)"
+            if [ -z "${version}" ]; then
+              echo "Could not determine latest upstream tag." >&2
+              exit 1
+            fi
           fi
           echo "Target pgvector version: ${version}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
