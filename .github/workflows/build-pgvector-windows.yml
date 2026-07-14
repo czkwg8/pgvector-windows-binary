@@ -1,0 +1,240 @@
+name: Build pgvector for Windows
+
+# Automatically checks upstream pgvector/pgvector for new releases,
+# compiles the extension against every supported PostgreSQL major version on
+# Windows, and publishes the packaged binaries to this repo's Releases.
+
+on:
+  schedule:
+    # Check for new upstream releases daily at 03:17 UTC.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "pgvector version/tag to build (e.g. v0.8.0). Leave empty to use the latest upstream release."
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if a release for this version already exists."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: pgvector/pgvector
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Work out which pgvector version to build, which PostgreSQL majors to
+  #    target, and whether the build is already done.
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      matrix: ${{ steps.pg.outputs.matrix }}
+    steps:
+      - name: Resolve target pgvector version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # Determine the target version: explicit input wins, otherwise the
+          # latest upstream release tag.
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="$(gh release view --repo "${UPSTREAM_REPO}" --json tagName --jq .tagName)"
+          fi
+          echo "Target pgvector version: ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          # Skip if we already published this version (unless forced).
+          if [ "${FORCE}" = "true" ]; then
+            echo "Force rebuild requested."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "${version}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${version} already exists in ${GITHUB_REPOSITORY}; nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release ${version} not found; will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve supported PostgreSQL versions
+        id: pg
+        run: |
+          set -euo pipefail
+
+          # PostgreSQL publishes the latest minor for every major line here.
+          # We build for each still-supported major, always using its latest
+          # minor (this also satisfies pgvector's "17.3+" requirement, since we
+          # never pick an older minor). pgver is major.latestMinor, e.g. 17.10.
+          matrix="$(curl -fsSL https://www.postgresql.org/versions.json \
+            | jq -c '{include: [.[]
+                | select(.supported)
+                | {pg: .major, pgver: "\(.major).\(.latestMinor)"}]
+                | sort_by(.pg | tonumber)}')"
+
+          echo "PostgreSQL build matrix: ${matrix}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Compile pgvector against each supported PostgreSQL major version.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.check.outputs.matrix) }}
+    steps:
+      - name: Checkout pgvector source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.version }}
+
+      - name: Download PostgreSQL ${{ matrix.pgver }} Windows binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pgver = "${{ matrix.pgver }}"
+
+          # EnterpriseDB pins an exact build suffix (usually -1, occasionally
+          # rebuilt as -2/-3). Probe the first few until one downloads.
+          $found = $false
+          foreach ($build in 1..4) {
+            $url = "https://get.enterprisedb.com/postgresql/postgresql-$pgver-$build-windows-x64-binaries.zip"
+            Write-Host "Trying $url"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\pg.zip"
+              Write-Host "Downloaded build suffix -$build"
+              $found = $true
+              break
+            } catch {
+              Write-Host "  not available"
+            }
+          }
+          if (-not $found) {
+            throw "Could not download PostgreSQL $pgver Windows binaries from EnterpriseDB."
+          }
+
+          Expand-Archive -Path "$env:RUNNER_TEMP\pg.zip" -DestinationPath "$env:RUNNER_TEMP\pg" -Force
+          # The archive extracts to a top-level "pgsql" directory.
+          $pgroot = Join-Path "$env:RUNNER_TEMP\pg" "pgsql"
+          if (-not (Test-Path (Join-Path $pgroot "include\server\postgres.h"))) {
+            throw "postgres.h not found under $pgroot; archive layout unexpected."
+          }
+          "PGROOT=$pgroot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        shell: cmd
+        run: |
+          nmake /F Makefile.win
+
+      - name: Install into staging directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Install into PGROOT, then collect just the files pgvector adds.
+          & cmd /c "nmake /F Makefile.win install"
+          if ($LASTEXITCODE -ne 0) { throw "nmake install failed" }
+
+          $stage = "$env:RUNNER_TEMP\package"
+          New-Item -ItemType Directory -Force -Path "$stage\lib" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage\share\extension" | Out-Null
+
+          Copy-Item "$env:PGROOT\lib\vector.dll" "$stage\lib\" -Force
+          Copy-Item "$env:PGROOT\share\extension\vector.control" "$stage\share\extension\" -Force
+          Copy-Item "$env:PGROOT\share\extension\vector--*.sql" "$stage\share\extension\" -Force
+
+          # Include license and a short install note in the package.
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$stage\" -Force }
+          @"
+          pgvector ${{ needs.check.outputs.version }} for PostgreSQL ${{ matrix.pg }} (Windows x64)
+          Built against PostgreSQL ${{ matrix.pgver }}.
+
+          Installation:
+            Copy the contents of this archive into your PostgreSQL install directory,
+            merging the lib\ and share\extension\ folders. Then in psql run:
+
+              CREATE EXTENSION vector;
+
+          Unofficial build. Source: https://github.com/${{ env.UPSTREAM_REPO }}
+          "@ | Out-File -FilePath "$stage\INSTALL.txt" -Encoding utf8
+
+          Get-ChildItem -Recurse $stage | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Create archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "pgvector-${{ needs.check.outputs.version }}-pg${{ matrix.pg }}-windows-x64"
+          $out = "$env:GITHUB_WORKSPACE\dist"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Compress-Archive -Path "$env:RUNNER_TEMP\package\*" -DestinationPath "$out\$name.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-pg${{ matrix.pg }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish all built archives to a single release in this repo.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -R dist
+
+          notes="Unofficial automated Windows x64 build of [pgvector ${VERSION}](https://github.com/${UPSTREAM_REPO}/releases/tag/${VERSION}).
+
+          Each archive targets a specific PostgreSQL major version. Extract it into your
+          PostgreSQL install directory (merging \`lib\\\` and \`share\\extension\\\`), then run
+          \`CREATE EXTENSION vector;\`.
+
+          Not affiliated with or endorsed by the pgvector project."
+
+          # Create the release if it doesn't exist yet, then (re)upload assets.
+          if ! gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${VERSION}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "pgvector ${VERSION} (Windows x64)" \
+              --notes "${notes}"
+          fi
+
+          gh release upload "${VERSION}" dist/*.zip --repo "${GITHUB_REPOSITORY}" --clobber
