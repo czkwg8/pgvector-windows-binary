@@ -111,7 +111,7 @@ jobs:
       matrix: ${{ fromJSON(needs.check.outputs.matrix) }}
     steps:
       - name: Checkout pgvector source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.check.outputs.version }}
@@ -202,7 +202,7 @@ jobs:
           Compress-Archive -Path "$env:RUNNER_TEMP\package\*" -DestinationPath "$out\$name.zip" -Force
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pgvector-pg${{ matrix.pg }}
           path: dist/*.zip
@@ -217,7 +217,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
