@@ -150,7 +150,7 @@ jobs:
           "PGROOT=$pgroot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Set up MSVC developer environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
           arch: x64
 
